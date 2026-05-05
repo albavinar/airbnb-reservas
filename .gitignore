@@ -1,0 +1,6 @@
+reservas/credentials.json
+reservas/token.json
+reservas/data_cache.json
+reservas/__pycache__/
+*.pyc
+*.log

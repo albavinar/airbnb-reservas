@@ -1,0 +1,36 @@
+name: Actualizar Reservas
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # 9:00h hora España (CEST = UTC+2)
+  workflow_dispatch:        # permite lanzarlo a mano desde GitHub
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Escribir credenciales Google
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > reservas/credentials.json
+          echo '${{ secrets.GOOGLE_TOKEN_JSON }}'       > reservas/token.json
+        working-directory: scripts
+
+      - name: Ejecutar actualización
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DATA_DIR: /tmp/airbnb
+        run: |
+          mkdir -p /tmp/airbnb
+          python reservas/actualizar_reservas.py
+        working-directory: scripts
