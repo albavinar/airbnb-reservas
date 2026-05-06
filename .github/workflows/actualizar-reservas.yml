@@ -24,7 +24,6 @@ jobs:
         run: |
           echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > reservas/credentials.json
           echo '${{ secrets.GOOGLE_TOKEN_JSON }}'       > reservas/token.json
-        working-directory: scripts
 
       - name: Ejecutar actualización
         env:
@@ -33,4 +32,3 @@ jobs:
         run: |
           mkdir -p /tmp/airbnb
           python reservas/actualizar_reservas.py
-        working-directory: scripts
