@@ -115,8 +115,9 @@ Apartamentos: Sweet, Sunset, Center, Open Sky, Duplex.
 Plataformas:  Airbnb, Booking, Holidu.
 Aliases de apartamentos:
 - Sweet   → "Sweet Apartment", "Sweet apt", "a pie de playa 50m", "Sweet apt- Sea Views"
-- Sunset  → "Ático deluxe", "vistas al mar, SPA", "BBQ privado"
-- Center  → "Center beach", "a una calle de la playa"
+- Sunset  → "Ático deluxe", "vistas al mar, SPA", "BBQ privado", "Sunset Apartment", "Sunset apt"
+- Center  → "Center beach", "a una calle de la playa", "Center Apartment", "Center apt"
+- Open Sky → "Open Sky Apartment", "Open Sky apt" (ATENCIÓN: Open Sky y Duplex NO reciben confirmaciones de reserva por email — sus reservas se gestionan manualmente. Si el email parece ser una nueva reserva para Open Sky o Duplex, es casi seguro un error de clasificación: revisa el contenido con cuidado. Si menciona BBQ privado, SPA, ático o terraza con vistas al mar → es Sunset. En caso de duda devuelve apartamento: null.)
 
 Reglas para clasificar pagos:
 - tipo "nueva_reserva": confirmación de nueva reserva.
@@ -525,8 +526,8 @@ def main():
         "=" * 60,
     ]
 
-    if not CLAUDE_BIN:
-        lines.append("❌ ERROR: claude CLI no encontrado. Instala Claude Code.")
+    if not CLAUDE_BIN and not os.environ.get("ANTHROPIC_API_KEY"):
+        lines.append("❌ ERROR: se necesita claude CLI o ANTHROPIC_API_KEY.")
         _write_log(lines)
         sys.exit(1)
 
@@ -600,6 +601,11 @@ def main():
 
         # Open Sky y Duplex se gestionan manualmente en Drive — no procesar emails
         if sheet_name in OS_DUPLEX_SHEETS:
+            lines.append(
+                f"  ⚠️  Email clasificado como {apto} ({tipo}) — "
+                f"este apartamento no recibe reservas por email. "
+                f"Revisa el email manualmente: {data.get('nombre')} {data.get('fecha_entrada')}"
+            )
             continue
 
         ws = wb_r[sheet_name]
