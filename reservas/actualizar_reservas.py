@@ -5,8 +5,21 @@ leyendo emails de Gmail (últimas 48h).
 Usa el claude CLI local para parsear emails — no necesita API key.
 """
 
-import argparse, base64, datetime, io, json, os, re, shutil, subprocess, sys
+import argparse, base64, datetime, io, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
+
+
+def _retry(fn, max_attempts=3, base_delay=2):
+    """Reintenta fn() con backoff exponencial. Lanza la última excepción si todo falla."""
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                time.sleep(base_delay ** attempt)
+    raise last_exc
 
 import openpyxl
 from openpyxl.styles import PatternFill, Alignment, Font, Border, Side
@@ -39,6 +52,7 @@ SCOPES = [
 
 DRIVE_RESERVAS_PARENT  = "1jXRPN1HjgWSmk2LTmVScyOaMaEtqlGax"  # carpeta BUSSINESS
 DRIVE_LIMPIEZAS_PARENT = "1fOZ-WPvEwnJZCioXDWUm32u_ZB_pP1qv"  # carpeta compartida Limpiezas Alba y Gisele
+DRIVE_CACHE_PARENT     = "15stGrk0IgfNAGupejzvpjVir0a-XqOT6"   # carpeta bot — sincroniza data_cache.json
 
 # ── Configuración de apartamentos ─────────────────────────────────────────────
 
@@ -76,8 +90,8 @@ OS_DUPLEX_SHEETS = {"Open Sky 2026", "Duplex 2026"}
 
 # Posiciones de adultos/niños/extras por sheet (1-indexed, para refresh_montaje y cache)
 SHEET_COL_MAP = {
-    "Open Sky 2026": {"adultos": 6, "ninos": 7, "extras": 11},
-    "Duplex 2026":   {"adultos": 7, "ninos": 6, "extras": 11},
+    "Open Sky 2026": {"adultos": 5, "ninos": 6, "extras": 10},
+    "Duplex 2026":   {"adultos": 5, "ninos": 6, "extras": 10},
 }
 _DEFAULT_COLS = {"adultos": 7, "ninos": 8, "extras": 12}
 
@@ -86,10 +100,35 @@ _AUTO_MONTAJE = {"", "1 CAMA", "2 CAMAS"}
 
 def camas_label(adultos, ninos, extras=""):
     total = (adultos or 0) + (ninos or 0)
-    lavanderia = "25€" in str(extras or "")
+    lavanderia = "25" in str(extras or "")
     return "2 CAMAS" if (lavanderia or total >= 3) else "1 CAMA"
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+# ── Telegram ─────────────────────────────────────────────────────────────────
+
+def _load_telegram_cfg():
+    cfg_path = SCRIPT_DIR / "config.json"
+    if not cfg_path.exists():
+        return None, None
+    try:
+        cfg = json.load(cfg_path.open())
+        return cfg.get("telegram_token"), cfg.get("chat_id")
+    except Exception:
+        return None, None
+
+def send_telegram(msg):
+    import urllib.request, urllib.parse
+    token, chat_id = _load_telegram_cfg()
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}).encode()
+    try:
+        urllib.request.urlopen(url, data=data, timeout=10)
+    except Exception:
+        pass
 
 
 # ── Claude CLI ────────────────────────────────────────────────────────────────
@@ -121,16 +160,28 @@ Aliases de apartamentos:
 
 Reglas para clasificar pagos:
 - tipo "nueva_reserva": confirmación de nueva reserva.
-- tipo "cancelacion": cancelación de reserva existente.
+- tipo "cancelacion": cancelación de reserva existente. Extrae el importe que el anfitrión conserva
+  en el campo cobro_cancelacion (p.ej. "tu cobro se ha actualizado a 87,21 €" → 87.21).
+  Si el reembolso es total y no se retiene nada, cobro_cancelacion es 0 o null.
 - tipo "modificacion": cambio confirmado de fechas, noches o importe de una reserva ya existente.
   Incluye los datos NUEVOS en los campos correspondientes. Además rellena fecha_entrada_anterior
   con la fecha de entrada original si aparece en el email (para poder localizar la reserva).
-- tipo "extra": SOLO pagos de servicios adicionales pequeños como lavandería (25€) o
-  check-in anticipado (30€) u otros servicios puntuales. El extra_canal es siempre "airbnb"
-  cuando el pago llega por notificación de Airbnb.
+- tipo "extra": pagos de servicios adicionales. Importes de extra reconocidos: 25€ (lavandería),
+  30€ (check-in anticipado), 100€ (mascota).
+  En emails "Has solicitado dinero a X" o "X ha aceptado tu solicitud para enviarte dinero":
+    1. Si el importe es exactamente 25€, 30€ o 100€ → extra directo.
+    2. Si el importe NO coincide pero al restarle un múltiplo de 3,5€ (tasa turística) el
+       resultado es 25€, 30€ o 100€ → es tasa + extra combinados. Clasifica como "extra"
+       y pon en extra_importe SOLO la parte del extra (25, 30 o 100), ignorando la tasa.
+       Ejemplo: 32€ enviados, tasa probable 7€ (2 personas × 1 noche) → extra_importe=25 (lavandería).
+    3. Cualquier otro importe que no encaje con ningún patrón → pon tipo "extra",
+       extra_importe=null y ambiguo=true con una nota descriptiva del importe y del huésped
+       para que el anfitrión pueda decidir manualmente.
+  El extra_canal es siempre "airbnb" cuando el pago llega por notificación de Airbnb.
 - tipo "irrelevante": TODO lo demás, incluyendo:
     * Depósitos de seguridad (el depósito de 200€ del Sunset, cualquier fianza)
-    * Tasa turística
+    * Tasa turística (importes típicos: múltiplos de 3,5€ por persona/noche)
+    * Emails "Has solicitado / ha aceptado" con importe distinto de 25€, 30€ o 100€
     * Pagos globales de reserva (el importe total de la estancia)
     * Notificaciones sin pago
     * Cualquier pago cuyo importe coincida con el total de la reserva o con una tasa/depósito conocido
@@ -156,7 +207,8 @@ Responde SOLO con JSON válido, sin markdown ni explicaciones:
   "ninos": null,
   "extra_importe": null,
   "extra_canal": "airbnb" | null,
-  "extra_concepto": "lavanderia" | "checkin_anticipado" | "otro" | null,
+  "extra_concepto": "lavanderia" | "checkin_anticipado" | "mascota" | "otro" | null,
+  "cobro_cancelacion": null,
   "ambiguo": false,
   "nota": null
 }}"""
@@ -168,9 +220,9 @@ def parse_email_with_claude(subject, body):
     if api_key:
         try:
             import anthropic
-            msg = anthropic.Anthropic(api_key=api_key).messages.create(
+            msg = anthropic.Anthropic(api_key=api_key, timeout=60).messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=256,
+                max_tokens=512,
                 messages=[{"role": "user", "content": prompt}],
             )
             text = msg.content[0].text.strip()
@@ -252,11 +304,23 @@ def get_thread_text(svc, tid):
 def parse_date(s):
     if not s:
         return None
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+    if isinstance(s, datetime.datetime):
+        return s
+    if isinstance(s, datetime.date):
+        return datetime.datetime.combine(s, datetime.time())
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.datetime.strptime(str(s), fmt)
         except ValueError:
             pass
+    return None
+
+
+def _to_date(v):
+    if isinstance(v, datetime.datetime):
+        return v.date()
+    if isinstance(v, datetime.date):
+        return v
     return None
 
 def is_separator(ws, r):
@@ -410,9 +474,10 @@ _CELL_BORDER = Border(
 
 def insert_limp_row(ws, apt_drive_name, checkout_dt):
     """Inserta fila en LIMPIEZAS_PROXIMAS ordenada por fecha con colores y bordes."""
-    apt_upper = apt_drive_name.upper()
+    apt_upper   = apt_drive_name.upper()
+    checkout_date = _to_date(checkout_dt)
     for r in range(2, ws.max_row + 1):
-        if ws.cell(r, 1).value == apt_upper and ws.cell(r, 2).value == checkout_dt:
+        if ws.cell(r, 1).value == apt_upper and _to_date(ws.cell(r, 2).value) == checkout_date:
             return False
 
     insert_at = ws.max_row + 1
@@ -452,9 +517,10 @@ def refresh_limp_colors(ws_l, today):
     changed = False
     for r in range(2, ws_l.max_row + 1):
         d = ws_l.cell(r, 2).value
-        if not (d and hasattr(d, "date")):
+        d_date = _to_date(d)
+        if not d_date:
             continue
-        if d.date() >= today:
+        if d_date >= today:
             continue
         for col in range(1, 6):
             cell = ws_l.cell(r, col)
@@ -465,11 +531,13 @@ def refresh_limp_colors(ws_l, today):
     return changed
 
 
-def refresh_montaje(ws_l, wb_r):
+def refresh_montaje(ws_l, wb_r, today=None):
     """Actualiza MONTAJE de cada fila con el huésped siguiente; respeta ediciones manuales."""
+    if today is None:
+        today = datetime.date.today()
     # Construir: apt_upper -> lista de (fecha_entrada, adultos, ninos, extras) ordenada
     apt_entries = {}
-    for sheet_name, apt_key in [(v, k) for k, v in DRIVE_MAP.items()]:
+    for sheet_name, apt_key in DRIVE_MAP.items():
         if sheet_name not in wb_r.sheetnames:
             continue
         ws = wb_r[sheet_name]
@@ -503,9 +571,13 @@ def refresh_montaje(ws_l, wb_r):
                 adultos, ninos, extras = a, n, e
                 break
         nuevo = camas_label(adultos, ninos, extras)
-        if nuevo != current:
-            ws_l.cell(r, 3).value = nuevo
-            changed = True
+        if nuevo == current:
+            continue
+        # Nunca bajar de 2 CAMAS a 1 CAMA — solo upgrades
+        if nuevo == "1 CAMA" and current == "2 CAMAS":
+            continue
+        ws_l.cell(r, 3).value = nuevo
+        changed = True
     return changed
 
 
@@ -515,7 +587,7 @@ def refresh_montaje(ws_l, wb_r):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=2, help="Días hacia atrás para buscar emails")
+    parser.add_argument("--days", type=int, default=4, help="Días hacia atrás para buscar emails")
     args = parser.parse_args()
     days = args.days
 
@@ -538,12 +610,23 @@ def main():
 
     # Auth Google
     creds = get_google_creds()
-    gmail = build("gmail", "v1", credentials=creds)
-    drive = build("drive", "v3", credentials=creds)
+    import httplib2
+    from google_auth_httplib2 import AuthorizedHttp as _AuthHttp
+    _http = _AuthHttp(creds, http=httplib2.Http(timeout=30))
+    gmail = build("gmail", "v1", http=_http)
+    drive = build("drive", "v3", http=_http)
 
     # Sincronizar desde Drive antes de tocar nada — los cambios manuales del Drive mandan
-    r_ok = download_from_drive(drive, str(RESERVAS_XLS), DRIVE_RESERVAS_PARENT)
-    l_ok = download_from_drive(drive, str(LIMPIEZAS_XLS), DRIVE_LIMPIEZAS_PARENT)
+    try:
+        r_ok = _retry(lambda: download_from_drive(drive, str(RESERVAS_XLS), DRIVE_RESERVAS_PARENT))
+    except Exception as exc:
+        lines.append(f"  ⚠️  No se pudo descargar RESERVAS de Drive: {exc}. Usando copia local.")
+        r_ok = RESERVAS_XLS.exists()
+    try:
+        l_ok = _retry(lambda: download_from_drive(drive, str(LIMPIEZAS_XLS), DRIVE_LIMPIEZAS_PARENT))
+    except Exception as exc:
+        lines.append(f"  ⚠️  No se pudo descargar LIMPIEZAS de Drive: {exc}. Usando copia local.")
+        l_ok = LIMPIEZAS_XLS.exists()
     lines.append(f"📥 Drive → local: RESERVAS={'✅' if r_ok else '⚠️ no encontrado'}, LIMPIEZAS={'✅' if l_ok else '⚠️ no encontrado'}")
 
     # Cargar Excel
@@ -581,9 +664,20 @@ def main():
     lines.append(f"Threads encontrados: {len(thread_ids)}")
 
     for tid in thread_ids:
-        subject = thread_subject(gmail, tid)
-        body    = get_thread_text(gmail, tid)
+        try:
+            subject = _retry(lambda t=tid: thread_subject(gmail, t))
+            body    = _retry(lambda t=tid: get_thread_text(gmail, t))
+        except Exception as exc:
+            lines.append(f"  ⚠️  Thread {tid}: error de red tras 3 intentos ({exc}), ignorado")
+            continue
+        if not subject.strip() and not body.strip():
+            lines.append(f"  ⚠️  Thread {tid}: sin contenido extraible, ignorado")
+            continue
         data    = parse_email_with_claude(subject, body)
+
+        nota = data.get("nota", "")
+        if nota and ("parse_error" in str(nota) or "api_error" in str(nota)):
+            lines.append(f"  ⚠️  Thread {tid} ({subject[:50]}): {nota}")
 
         # Forzar plataforma "Directa" para confirmaciones propias
         if tid in direct_thread_ids and data.get("tipo") == "nueva_reserva":
@@ -591,6 +685,7 @@ def main():
 
         tipo = data.get("tipo", "irrelevante")
         apto = data.get("apartamento")
+        lines.append(f"  📧 {subject[:60]}: {tipo}/{apto or '–'}")
         if tipo == "irrelevante" or not apto:
             continue
 
@@ -629,18 +724,38 @@ def main():
         elif tipo == "cancelacion":
             fecha_e_dt = parse_date(data.get("fecha_entrada"))
             row_num = find_guest_row(ws, data.get("nombre"), fecha_e_dt)
-            if row_num:
+            if row_num and row_num < find_total_row(ws):
                 # Reservas directas no se tocan bajo ningún concepto
                 if str(ws.cell(row_num, 6).value or "").lower() == "directa":
                     lines.append(f"  ⚠️  Cancelación ignorada (reserva directa): {data.get('nombre')}")
                     continue
-                fecha_s_val = ws.cell(row_num, 2).value
-                ws.delete_rows(row_num)
-                update_sum_formulas(ws, find_total_row(ws))
-                reservas_changed = True
-                canceladas.append(f"{apto} | {data.get('nombre')} | {data.get('fecha_entrada')}")
+                fecha_s_val  = ws.cell(row_num, 2).value
+                fecha_s_date = _to_date(fecha_s_val)
+                apt_drive = DRIVE_MAP.get(sheet_name, "")
+                try:
+                    cobro = float(data.get("cobro_cancelacion") or 0)
+                except (TypeError, ValueError):
+                    cobro = 0
+
+                if cobro > 0:
+                    # Cancelación parcial: mantener fila, actualizar importe y marcar
+                    ws.cell(row_num, 5).value  = cobro
+                    ws.cell(row_num, 9).value  = 0
+                    ws.cell(row_num, 12).value = "CANCELADA"
+                    reservas_changed = True
+                    canceladas.append(f"{apto} | {data.get('nombre')} | {data.get('fecha_entrada')} | cobro {cobro}€")
+                else:
+                    # Cancelación total: eliminar fila
+                    ws.delete_rows(row_num)
+                    update_sum_formulas(ws, find_total_row(ws))
+                    reservas_changed = True
+                    canceladas.append(f"{apto} | {data.get('nombre')} | {data.get('fecha_entrada')}")
+
+                # En ambos casos: eliminar la limpieza de salida del huésped cancelado
                 for r in range(ws_l.max_row, 1, -1):
-                    if ws_l.cell(r, 2).value == fecha_s_val:
+                    if (fecha_s_date
+                            and str(ws_l.cell(r, 1).value or "").upper() == apt_drive.upper()
+                            and _to_date(ws_l.cell(r, 2).value) == fecha_s_date):
                         ws_l.delete_rows(r)
                         limpiezas_changed = True
                         break
@@ -700,7 +815,10 @@ def main():
                 existing_extra = ws.cell(row_num, 12).value
                 if existing_extra:
                     continue
-                importe = data.get("extra_importe") or 25
+                # Ambiguo sin importe claro → no escribir nada, ya se notificó por Telegram
+                importe = data.get("extra_importe")
+                if not importe:
+                    continue
                 ws.cell(row_num, 12).value = f"{importe}€ {canal}"
                 extras_log.append(f"{apto} | {data.get('nombre')} | {importe}€ {canal}")
                 reservas_changed = True
@@ -715,18 +833,29 @@ def main():
         limpiezas_changed = True
 
     # Recalcular MONTAJE con la reserva siguiente (respeta ediciones manuales)
-    if refresh_montaje(ws_l, wb_r):
+    if refresh_montaje(ws_l, wb_r, today):
         limpiezas_changed = True
 
-    # Guardar y subir
-    wb_r.save(str(RESERVAS_XLS))
-    wb_l.save(str(LIMPIEZAS_XLS))
+    # Guardar y subir solo si hubo cambios (evita sobreescribir ediciones manuales en Drive)
+    if reservas_changed:
+        wb_r.save(str(RESERVAS_XLS))
+        try:
+            _retry(lambda: upload_file(drive, str(RESERVAS_XLS), DRIVE_RESERVAS_PARENT))
+            lines.append("✅ RESERVAS_2026.xlsx subido a Drive")
+        except Exception as exc:
+            lines.append(f"  ⚠️  RESERVAS guardado localmente pero no subido a Drive: {exc}")
+    else:
+        lines.append("ℹ️  RESERVAS sin cambios — no se sube a Drive")
 
-    upload_file(drive, str(RESERVAS_XLS), DRIVE_RESERVAS_PARENT)
-    lines.append("✅ RESERVAS_2026.xlsx subido a Drive")
-
-    upload_file(drive, str(LIMPIEZAS_XLS), DRIVE_LIMPIEZAS_PARENT)
-    lines.append("✅ LIMPIEZAS_2026.xlsx subido a Drive")
+    if limpiezas_changed:
+        wb_l.save(str(LIMPIEZAS_XLS))
+        try:
+            _retry(lambda: upload_file(drive, str(LIMPIEZAS_XLS), DRIVE_LIMPIEZAS_PARENT))
+            lines.append("✅ LIMPIEZAS_2026.xlsx subido a Drive")
+        except Exception as exc:
+            lines.append(f"  ⚠️  LIMPIEZAS guardado localmente pero no subido a Drive: {exc}")
+    else:
+        lines.append("ℹ️  LIMPIEZAS sin cambios — no se sube a Drive")
 
     # Resumen
     if not (nuevas or canceladas or extras_log):
@@ -745,17 +874,20 @@ def main():
         lines.append("  ⚠️ Ambiguos para revisión manual:")
         for a in ambiguos:
             lines.append(f"    {a}")
+        msg = "⚠️ <b>Pago sin clasificar — revisión manual</b>\n\n"
+        msg += "\n".join(f"• {a}" for a in ambiguos)
+        msg += "\n\n¿Es lavandería (25€), mascota (100€), check-in anticipado (30€) u otro concepto? Apúntalo manualmente en el Excel."
+        send_telegram(msg)
 
     lines.append("=" * 60 + "\n")
     _write_log(lines)
-    print("\n".join(lines))
 
-    # Exportar caché JSON para el bot de Telegram
-    _write_bot_cache(wb_r, wb_l)
+    # Exportar caché JSON para el bot de Telegram y sincronizar a Drive
+    _write_bot_cache(wb_r, wb_l, drive)
 
 
-def _write_bot_cache(wb_r, wb_l):
-    """Exporta reservas y limpiezas a JSON accesible por el bot."""
+def _write_bot_cache(wb_r, wb_l, drive=None):
+    """Exporta reservas y limpiezas a JSON accesible por el bot, y lo sube a Drive."""
     today = datetime.date.today()
 
     def _num(v):
@@ -780,19 +912,19 @@ def _write_bot_cache(wb_r, wb_l):
             if not fe or not hasattr(fe, "strftime"):
                 continue
             if is_os_dup:
-                # New structure: col9=PLATAFORMA(idx8), col10=TOTAL RESERVA(idx9), col11=EXTRAS(idx10)
+                # Estructura OS/Duplex: col5=ADULTOS, col6=NINOS, col8=PLATAFORMA, col9=TOTAL, col10=EXTRAS
                 reservas.append({
                     "apt":      apt,
                     "nombre":   nombre,
                     "entrada":  fe.strftime("%Y-%m-%d"),
                     "salida":   fs.strftime("%Y-%m-%d") if (fs and hasattr(fs, "strftime")) else str(fs or ""),
                     "noches":   int(_num(row[3])),
-                    "total":    _num(row[9]),   # TOTAL RESERVA (col 10)
-                    "platform": str(row[8] or "").strip() or "—",  # PLATAFORMA (col 9)
+                    "total":    _num(row[8]),   # TOTAL (col 9, idx 8)
+                    "platform": str(row[7] or "").strip() or "—",  # PLATAFORMA (col 8, idx 7)
                     "adultos":  int(_num(row[cols["adultos"]-1])),
                     "ninos":    int(_num(row[cols["ninos"]-1])),
                     "tasas":    0.0,
-                    "extras":   str(row[10] or "").strip(),  # EXTRAS (col 11)
+                    "extras":   str(row[cols["extras"]-1] or "").strip(),  # EXTRAS (col 10, idx 9)
                 })
             else:
                 reservas.append({
@@ -835,6 +967,11 @@ def _write_bot_cache(wb_r, wb_l):
     }
     cache_path = SCRIPT_DIR / "data_cache.json"
     cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    if drive:
+        try:
+            upload_file(drive, str(cache_path), DRIVE_CACHE_PARENT)
+        except Exception:
+            pass
 
 
 def _write_log(lines):
