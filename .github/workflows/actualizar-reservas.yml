@@ -1,9 +1,7 @@
 name: Actualizar Reservas
 
 on:
-  schedule:
-    - cron: '0 7 * * *'   # 9:00h hora España (CEST = UTC+2)
-  workflow_dispatch:        # permite lanzarlo a mano desde GitHub
+  workflow_dispatch:        # solo manual desde GitHub (el agente remoto de Claude Code es el scheduler diario)
 
 jobs:
   actualizar:
