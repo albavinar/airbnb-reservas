@@ -588,8 +588,12 @@ def refresh_montaje(ws_l, wb_r, today=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=4, help="Días hacia atrás para buscar emails")
+    parser.add_argument("--emails-json", metavar="PATH", help="JSON con emails pre-obtenidos; omite Gmail API")
+    parser.add_argument("--skip-drive", action="store_true", help="No descarga/sube a Drive; el agente lo gestiona externamente")
     args = parser.parse_args()
     days = args.days
+    emails_json_path = args.emails_json
+    skip_drive = args.skip_drive
 
     today = datetime.date.today()
     lines = [
@@ -603,31 +607,35 @@ def main():
         _write_log(lines)
         sys.exit(1)
 
-    if not CREDS_FILE.exists():
-        lines.append("❌ ERROR: falta credentials.json. Sigue las instrucciones de setup.")
-        _write_log(lines)
-        sys.exit(1)
+    drive = None
+    if not skip_drive:
+        if not CREDS_FILE.exists():
+            lines.append("❌ ERROR: falta credentials.json. Sigue las instrucciones de setup.")
+            _write_log(lines)
+            sys.exit(1)
 
-    # Auth Google
-    creds = get_google_creds()
-    import httplib2
-    from google_auth_httplib2 import AuthorizedHttp as _AuthHttp
-    _http = _AuthHttp(creds, http=httplib2.Http(timeout=30))
-    gmail = build("gmail", "v1", http=_http)
-    drive = build("drive", "v3", http=_http)
+        # Auth Google
+        creds = get_google_creds()
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp as _AuthHttp
+        _http = _AuthHttp(creds, http=httplib2.Http(timeout=30))
+        gmail = build("gmail", "v1", http=_http)
+        drive = build("drive", "v3", http=_http)
 
-    # Sincronizar desde Drive antes de tocar nada — los cambios manuales del Drive mandan
-    try:
-        r_ok = _retry(lambda: download_from_drive(drive, str(RESERVAS_XLS), DRIVE_RESERVAS_PARENT))
-    except Exception as exc:
-        lines.append(f"  ⚠️  No se pudo descargar RESERVAS de Drive: {exc}. Usando copia local.")
-        r_ok = RESERVAS_XLS.exists()
-    try:
-        l_ok = _retry(lambda: download_from_drive(drive, str(LIMPIEZAS_XLS), DRIVE_LIMPIEZAS_PARENT))
-    except Exception as exc:
-        lines.append(f"  ⚠️  No se pudo descargar LIMPIEZAS de Drive: {exc}. Usando copia local.")
-        l_ok = LIMPIEZAS_XLS.exists()
-    lines.append(f"📥 Drive → local: RESERVAS={'✅' if r_ok else '⚠️ no encontrado'}, LIMPIEZAS={'✅' if l_ok else '⚠️ no encontrado'}")
+        # Sincronizar desde Drive antes de tocar nada — los cambios manuales del Drive mandan
+        try:
+            r_ok = _retry(lambda: download_from_drive(drive, str(RESERVAS_XLS), DRIVE_RESERVAS_PARENT))
+        except Exception as exc:
+            lines.append(f"  ⚠️  No se pudo descargar RESERVAS de Drive: {exc}. Usando copia local.")
+            r_ok = RESERVAS_XLS.exists()
+        try:
+            l_ok = _retry(lambda: download_from_drive(drive, str(LIMPIEZAS_XLS), DRIVE_LIMPIEZAS_PARENT))
+        except Exception as exc:
+            lines.append(f"  ⚠️  No se pudo descargar LIMPIEZAS de Drive: {exc}. Usando copia local.")
+            l_ok = LIMPIEZAS_XLS.exists()
+        lines.append(f"📥 Drive → local: RESERVAS={'✅' if r_ok else '⚠️ no encontrado'}, LIMPIEZAS={'✅' if l_ok else '⚠️ no encontrado'}")
+    else:
+        lines.append("📥 Drive: gestionado externamente (--skip-drive)")
 
     # Cargar Excel
     wb_r = openpyxl.load_workbook(str(RESERVAS_XLS))
@@ -638,38 +646,52 @@ def main():
     limpiezas_changed = False
     nuevas, canceladas, extras_log, ambiguos = [], [], [], []
 
-    # Buscar emails
-    queries = [
-        f"from:airbnb.com newer_than:{days}d",
-        f"from:booking.com newer_than:{days}d",
-        f"(from:holidu.com OR from:holidu.de) newer_than:{days}d",
-        f"(pago recibido OR payment received OR transferencia) newer_than:{days}d",
-    ]
-    seen, thread_ids = set(), []
-    for q in queries:
-        for tid in search_threads(gmail, q):
+    # Obtener emails: desde JSON pre-obtenido o desde Gmail API
+    if emails_json_path:
+        with open(emails_json_path, encoding="utf-8") as f:
+            email_records = json.load(f)
+        direct_thread_ids = {r["thread_id"] for r in email_records if r.get("is_direct")}
+        thread_ids = [r["thread_id"] for r in email_records]
+        email_map = {r["thread_id"]: r for r in email_records}
+        lines.append(f"Threads encontrados: {len(thread_ids)} (desde {emails_json_path})")
+    else:
+        gmail_svc = build("gmail", "v1", http=_http) if not skip_drive else None
+        queries = [
+            f"from:airbnb.com newer_than:{days}d",
+            f"from:booking.com newer_than:{days}d",
+            f"(from:holidu.com OR from:holidu.de) newer_than:{days}d",
+            f"(pago recibido OR payment received OR transferencia) newer_than:{days}d",
+        ]
+        seen, thread_ids = set(), []
+        for q in queries:
+            for tid in search_threads(gmail_svc, q):
+                if tid not in seen:
+                    seen.add(tid)
+                    thread_ids.append(tid)
+
+        direct_thread_ids = set()
+        direct_days = max(days, 7)
+        for tid in search_threads(gmail_svc, f"from:calafellapartament@gmail.com newer_than:{direct_days}d"):
+            direct_thread_ids.add(tid)
             if tid not in seen:
                 seen.add(tid)
                 thread_ids.append(tid)
 
-    # Emails de reservas directas
-    direct_thread_ids = set()
-    direct_days = max(days, 7)
-    for tid in search_threads(gmail, f"from:calafellapartament@gmail.com newer_than:{direct_days}d"):
-        direct_thread_ids.add(tid)
-        if tid not in seen:
-            seen.add(tid)
-            thread_ids.append(tid)
-
-    lines.append(f"Threads encontrados: {len(thread_ids)}")
+        email_map = None
+        lines.append(f"Threads encontrados: {len(thread_ids)}")
 
     for tid in thread_ids:
-        try:
-            subject = _retry(lambda t=tid: thread_subject(gmail, t))
-            body    = _retry(lambda t=tid: get_thread_text(gmail, t))
-        except Exception as exc:
-            lines.append(f"  ⚠️  Thread {tid}: error de red tras 3 intentos ({exc}), ignorado")
-            continue
+        if email_map:
+            rec = email_map[tid]
+            subject = rec.get("subject", "")
+            body    = rec.get("body", "")
+        else:
+            try:
+                subject = _retry(lambda t=tid: thread_subject(gmail, t))
+                body    = _retry(lambda t=tid: get_thread_text(gmail, t))
+            except Exception as exc:
+                lines.append(f"  ⚠️  Thread {tid}: error de red tras 3 intentos ({exc}), ignorado")
+                continue
         if not subject.strip() and not body.strip():
             lines.append(f"  ⚠️  Thread {tid}: sin contenido extraible, ignorado")
             continue
@@ -839,21 +861,27 @@ def main():
     # Guardar y subir solo si hubo cambios (evita sobreescribir ediciones manuales en Drive)
     if reservas_changed:
         wb_r.save(str(RESERVAS_XLS))
-        try:
-            _retry(lambda: upload_file(drive, str(RESERVAS_XLS), DRIVE_RESERVAS_PARENT))
-            lines.append("✅ RESERVAS_2026.xlsx subido a Drive")
-        except Exception as exc:
-            lines.append(f"  ⚠️  RESERVAS guardado localmente pero no subido a Drive: {exc}")
+        if skip_drive:
+            lines.append("✅ RESERVAS_2026.xlsx guardado (Drive: gestionado externamente)")
+        else:
+            try:
+                _retry(lambda: upload_file(drive, str(RESERVAS_XLS), DRIVE_RESERVAS_PARENT))
+                lines.append("✅ RESERVAS_2026.xlsx subido a Drive")
+            except Exception as exc:
+                lines.append(f"  ⚠️  RESERVAS guardado localmente pero no subido a Drive: {exc}")
     else:
         lines.append("ℹ️  RESERVAS sin cambios — no se sube a Drive")
 
     if limpiezas_changed:
         wb_l.save(str(LIMPIEZAS_XLS))
-        try:
-            _retry(lambda: upload_file(drive, str(LIMPIEZAS_XLS), DRIVE_LIMPIEZAS_PARENT))
-            lines.append("✅ LIMPIEZAS_2026.xlsx subido a Drive")
-        except Exception as exc:
-            lines.append(f"  ⚠️  LIMPIEZAS guardado localmente pero no subido a Drive: {exc}")
+        if skip_drive:
+            lines.append("✅ LIMPIEZAS_2026.xlsx guardado (Drive: gestionado externamente)")
+        else:
+            try:
+                _retry(lambda: upload_file(drive, str(LIMPIEZAS_XLS), DRIVE_LIMPIEZAS_PARENT))
+                lines.append("✅ LIMPIEZAS_2026.xlsx subido a Drive")
+            except Exception as exc:
+                lines.append(f"  ⚠️  LIMPIEZAS guardado localmente pero no subido a Drive: {exc}")
     else:
         lines.append("ℹ️  LIMPIEZAS sin cambios — no se sube a Drive")
 
